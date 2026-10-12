@@ -1,5 +1,5 @@
 
-name: Build UFI103S Debian 13 ARM64
+name: UFI103S Debian 13 Source Build
 
 on:
   workflow_dispatch:
@@ -9,236 +9,231 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
 
     steps:
-      - name: Enable ARM64 emulation
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Create Debian 13 rootfs
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential bc bison flex \
+            libssl-dev libelf-dev dwarves \
+            device-tree-compiler \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            debootstrap qemu-user-static \
+            binfmt-support cpio rsync \
+            kmod e2fsprogs \
+            android-sdk-libsparse-utils \
+            python3 python3-pip
+
+      - name: Clone UFI103S image builder
+        run: |
+          git clone --recurse-submodules \
+            https://github.com/hmhmdcy/OpenStick-Builder-UFI001C.git \
+            builder
+
+      - name: Install image builder dependencies
+        run: |
+          cd builder
+          sudo bash scripts/install_deps.sh
+
+      - name: Clone Linux source
+        run: |
+          git clone --depth=1 \
+            --branch msm8916/6.12.1 \
+            https://github.com/a520ass/linux-ufi.git \
+            linux
+
+      - name: Configure UFI103S device tree
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path(
+              "linux/arch/arm64/boot/dts/qcom/"
+              "msm8916-thwc-ufi001c.dts"
+          )
+          if not p.is_file():
+              raise SystemExit(f"UFI103S DTS not found: {p}")
+
+          s = p.read_text()
+          if not re.search(r"&mpss\s*\{", s):
+              raise SystemExit("MPSS node not found; refusing blind patch")
+
+          # Disable the modem processor node.
+          s, n = re.subn(
+              r"(&mpss\s*\{)",
+              r'\1\n\tstatus = "disabled";',
+              s,
+              count=1
+          )
+          if n != 1:
+              raise SystemExit("Failed to patch MPSS node")
+
+          p.write_text(s)
+          PY
+
+      - name: Build Linux kernel, modules and DTB
         shell: bash
         run: |
           set -euxo pipefail
 
-          docker run --platform linux/arm64 \
-            --name ufi-rootfs -d debian:trixie-slim \
-            sleep infinity
+          SRC="$GITHUB_WORKSPACE/linux"
+          OUT="$GITHUB_WORKSPACE/kernel-out"
+          CROSS=aarch64-linux-gnu-
 
-          docker exec ufi-rootfs bash -euxc '
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              systemd systemd-sysv \
-              openssh-server ca-certificates \
-              curl wget iproute2 iputils-ping \
-              procps nano sudo tzdata kmod udev \
-              netbase hostapd dnsmasq iw rfkill iptables
+          make -C "$SRC" O="$OUT" \
+            ARCH=arm64 CROSS_COMPILE="$CROSS" defconfig
 
-            echo "root:2289256127" | chpasswd
+          for option in \
+            ARCH_QCOM SERIAL_MSM SERIAL_MSM_CONSOLE \
+            MMC MMC_BLOCK MMC_SDHCI MMC_SDHCI_MSM \
+            EXT4_FS DEVTMPFS DEVTMPFS_MOUNT \
+            BLK_DEV_INITRD MODULES FW_LOADER \
+            USB_GADGET USB_CONFIGFS USB_CONFIGFS_RNDIS \
+            USB_CHIPIDEA USB_CHIPIDEA_UDC \
+            CFG80211 MAC80211 WCN36XX
+          do
+            "$SRC/scripts/config" \
+              --file "$OUT/.config" --enable "$option"
+          done
 
-            mkdir -p /etc/ssh/sshd_config.d
-            cat > /etc/ssh/sshd_config.d/10-ufi.conf <<EOF
+          make -C "$SRC" O="$OUT" \
+            ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig
+
+          make -C "$SRC" O="$OUT" \
+            ARCH=arm64 CROSS_COMPILE="$CROSS" \
+            -j2 Image modules dtbs
+
+          test -s "$OUT/arch/arm64/boot/Image"
+          test -s "$OUT/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
+
+          cp \
+            "$OUT/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb" \
+            builder/dtbs/
+
+      - name: Configure rootfs and replace prebuilt kernel
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # Root password and SSH configuration.
+          p = Path("builder/scripts/setup.sh")
+          s = p.read_text()
+
+          s = s.replace(
+              "passwd -d root",
+              "echo 'root:2289256127' | chpasswd"
+          )
+
+          ssh = """
+          mkdir -p /etc/ssh/sshd_config.d
+          cat > /etc/ssh/sshd_config.d/10-ufi103s.conf <<'EOF'
           PermitRootLogin yes
           PasswordAuthentication yes
           KbdInteractiveAuthentication no
           EOF
+          """
 
-            mkdir -p /etc/hostapd
-            cat > /etc/hostapd/hostapd.conf <<EOF
-          interface=wlan0
-          driver=nl80211
-          country_code=CN
-          ssid=UFI103S
-          hw_mode=g
-          channel=6
-          wpa=2
-          wpa_passphrase=12345678
-          wpa_key_mgmt=WPA-PSK
-          rsn_pairwise=CCMP
-          EOF
+          if "10-ufi103s.conf" not in s:
+              s += "\n" + ssh + "\n"
 
-            mkdir -p /etc/dnsmasq.d
-            cat > /etc/dnsmasq.d/ufi103s.conf <<EOF
-          port=53
-          no-resolv
-          server=223.5.5.5
-          server=119.29.29.29
-          bind-dynamic
-          interface=wlan0
-          interface=usb0
-          dhcp-authoritative
-          dhcp-range=set:wifi,192.168.50.20,192.168.50.100,255.255.255.0,12h
-          dhcp-option=tag:wifi,option:router,192.168.50.1
-          dhcp-option=tag:wifi,option:dns-server,192.168.50.1
-          dhcp-range=set:usb,192.168.100.20,192.168.100.100,255.255.255.0,12h
-          dhcp-option=tag:usb,option:router,192.168.100.1
-          dhcp-option=tag:usb,option:dns-server,192.168.100.1
-          EOF
+          # Remove modem-management userspace packages.
+          lines = []
+          for line in s.splitlines():
+              pkg = line.strip().rstrip("\\").strip()
+              if pkg in {"modemmanager", "qrtr-tools", "rmtfs"}:
+                  continue
+              lines.append(line)
+          p.write_text("\n".join(lines) + "\n")
 
-            mkdir -p /etc/sysctl.d
-            echo "net.ipv4.ip_forward=1" \
-              > /etc/sysctl.d/99-ufi-forwarding.conf
+          # Customize the network profiles.
+          root = Path("builder/configs")
+          for p in root.rglob("*"):
+              if not p.is_file():
+                  continue
+              try:
+                  text = p.read_text()
+              except (UnicodeDecodeError, OSError):
+                  continue
 
-            mkdir -p /usr/local/sbin
-            cat > /usr/local/sbin/ufi-usb-gadget.sh <<EOF
-          #!/bin/sh
-          set -eu
-          mountpoint -q /sys/kernel/config || \
-            mount -t configfs configfs /sys/kernel/config
-          G=/sys/kernel/config/usb_gadget/g1
-          mkdir -p "\$G"
+              text = text.replace("192.168.4.", "192.168.50.")
+              text = text.replace("192.168.5.", "192.168.100.")
+              text = text.replace("Openstick", "UFI103S")
+              text = text.replace("openstick", "UFI103S")
+              text = re.sub(
+                  r"(?m)^(\s*psk\s*=\s*).*$",
+                  r"\g<1>12345678",
+                  text
+              )
+              p.write_text(text)
 
-          if [ -z "\$(cat "\$G/UDC" 2>/dev/null || true)" ]; then
-            echo 0x18d1 > "\$G/idVendor"
-            echo 0xd001 > "\$G/idProduct"
-            mkdir -p "\$G/strings/0x409"
-            mkdir -p "\$G/configs/c.1/strings/0x409"
-            mkdir -p "\$G/functions/rndis.usb0"
+          # Replace the builder's precompiled kernel download with
+          # the kernel compiled by this workflow.
+          p = Path("builder/scripts/debootstrap.sh")
+          s = p.read_text()
 
-            echo UFI103S > "\$G/strings/0x409/product"
-            echo UFI103S > "\$G/strings/0x409/serialnumber"
-            echo OpenAI > "\$G/strings/0x409/manufacturer"
-            echo USB-Network > "\$G/configs/c.1/strings/0x409/configuration"
-            echo 120 > "\$G/configs/c.1/MaxPower"
+          start = s.find("# install kernel")
+          end = s.find(
+              "mkdir -p ${CHROOT}/boot/extlinux",
+              start
+          )
 
-            echo 02:11:22:33:44:55 > "\$G/functions/rndis.usb0/dev_addr"
-            echo 02:11:22:33:44:66 > "\$G/functions/rndis.usb0/host_addr"
+          if start < 0 or end < 0:
+              raise SystemExit(
+                  "Could not locate kernel install section; stopping"
+              )
 
-            [ -e "\$G/configs/c.1/rndis.usb0" ] || \
-              ln -s "\$G/functions/rndis.usb0" "\$G/configs/c.1/"
+          replacement = r'''
+          # Install the kernel compiled from source.
+          KERNEL_SRC="$(pwd)/../linux"
+          KERNEL_OUT="$(pwd)/../kernel-out"
 
-            echo ci_hdrc.0 > "\$G/UDC"
-          fi
+          install -D -m 0644 \
+            "${KERNEL_OUT}/arch/arm64/boot/Image" \
+            "${CHROOT}/boot/vmlinuz"
 
-          i=0
-          until ip link show usb0 >/dev/null 2>&1; do
-            i=\$((i+1))
-            [ "\$i" -lt 15 ] || exit 1
-            sleep 1
+          make -C "${KERNEL_SRC}" O="${KERNEL_OUT}" \
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="${CHROOT}" modules_install
+
+          '''
+
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
+          PY
+
+      - name: Build complete Debian firmware
+        run: |
+          cd builder
+          sudo bash ./build_for_ufi001c.sh
+
+      - name: Verify firmware artifacts
+        run: |
+          set -euxo pipefail
+          cd builder/files
+
+          for f in \
+            gpt_both0.bin hyp.mbn rpm.mbn sbl1.mbn \
+            tz.mbn aboot.mbn boot.bin rootfs.bin
+          do
+            test -s "$f"
           done
-          ip link set usb0 up
-          ip address replace 192.168.100.1/24 dev usb0
-          EOF
-            chmod 755 /usr/local/sbin/ufi-usb-gadget.sh
 
-            cat > /usr/local/sbin/ufi-nat.sh <<EOF
-          #!/bin/sh
-          set -eu
-          sysctl -w net.ipv4.ip_forward=1
+          sha256sum *.bin > SHA256SUMS.txt
+          ls -lh
 
-          iptables -t nat -C POSTROUTING -s 192.168.50.0/24 ! -o wlan0 -j MASQUERADE 2>/dev/null ||
-            iptables -t nat -A POSTROUTING -s 192.168.50.0/24 ! -o wlan0 -j MASQUERADE
-
-          iptables -t nat -C POSTROUTING -s 192.168.100.0/24 ! -o usb0 -j MASQUERADE 2>/dev/null ||
-            iptables -t nat -A POSTROUTING -s 192.168.100.0/24 ! -o usb0 -j MASQUERADE
-
-          iptables -C FORWARD -i wlan0 ! -o wlan0 -j ACCEPT 2>/dev/null ||
-            iptables -A FORWARD -i wlan0 ! -o wlan0 -j ACCEPT
-          iptables -C FORWARD -i usb0 ! -o usb0 -j ACCEPT 2>/dev/null ||
-            iptables -A FORWARD -i usb0 ! -o usb0 -j ACCEPT
-          iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
-            iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-          EOF
-            chmod 755 /usr/local/sbin/ufi-nat.sh
-
-            cat > /etc/systemd/system/ufi-usb-gadget.service <<EOF
-          [Unit]
-          Description=UFI103S USB RNDIS Network
-          After=local-fs.target
-          Before=dnsmasq.service
-
-          [Service]
-          Type=oneshot
-          ExecStart=/usr/local/sbin/ufi-usb-gadget.sh
-          RemainAfterExit=yes
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-            cat > /etc/systemd/system/ufi-wifi-ap.service <<EOF
-          [Unit]
-          Description=UFI103S WiFi Hotspot
-          After=network-pre.target
-          Before=dnsmasq.service
-
-          [Service]
-          Type=simple
-          ExecStartPre=/usr/sbin/ip link set wlan0 up
-          ExecStartPre=/usr/sbin/ip address replace 192.168.50.1/24 dev wlan0
-          ExecStart=/usr/sbin/hostapd /etc/hostapd/hostapd.conf
-          Restart=on-failure
-          RestartSec=3
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-            cat > /etc/systemd/system/ufi-nat.service <<EOF
-          [Unit]
-          Description=UFI103S Network Forwarding
-          After=ufi-usb-gadget.service ufi-wifi-ap.service dnsmasq.service
-
-          [Service]
-          Type=oneshot
-          ExecStart=/usr/local/sbin/ufi-nat.sh
-          RemainAfterExit=yes
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-            mkdir -p /etc/systemd/system/ufi-ssh-hostkeys.service.d
-            cat > /etc/systemd/system/ufi-ssh-hostkeys.service <<EOF
-          [Unit]
-          Description=Generate SSH host keys
-          Before=ssh.service
-
-          [Service]
-          Type=oneshot
-          ExecStart=/usr/bin/ssh-keygen -A
-          RemainAfterExit=yes
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-            mkdir -p /etc/systemd/system/ssh.service.d
-            cat > /etc/systemd/system/ssh.service.d/10-ufi.conf <<EOF
-          [Unit]
-          Wants=ufi-ssh-hostkeys.service
-          After=ufi-ssh-hostkeys.service
-          EOF
-
-            rm -f /etc/ssh/ssh_host_*
-            ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-            echo Asia/Shanghai > /etc/timezone
-            truncate -s 0 /etc/machine-id
-            mkdir -p /run/sshd
-
-            systemctl --root=/ enable \
-              ssh.service dnsmasq.service \
-              ufi-usb-gadget.service \
-              ufi-wifi-ap.service \
-              ufi-nat.service \
-              ufi-ssh-hostkeys.service
-
-            apt-get clean
-            rm -rf /var/lib/apt/lists/*
-          '
-
-          docker export ufi-rootfs | gzip -1 \
-            > debian13-ufi103s-arm64-rootfs.tar.gz
-
-          sha256sum debian13-ufi103s-arm64-rootfs.tar.gz \
-            > SHA256SUMS.txt
-
-      - name: Upload build artifacts
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: debian13-ufi103s-arm64
-          path: |
-            debian13-ufi103s-arm64-rootfs.tar.gz
-            SHA256SUMS.txt
+          name: UFI103S-Debian13-Source-Firmware
+          path: builder/files/*
+          if-no-files-found: error
           retention-days: 14
