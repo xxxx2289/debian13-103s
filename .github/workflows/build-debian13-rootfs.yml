@@ -1,1 +1,80 @@
-.git
+
+name: Build Debian 13 ARM64 RootFS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enable ARM64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build Debian 13 ARM64 root filesystem
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          docker run \
+            --platform linux/arm64 \
+            --name debian13-rootfs \
+            -d debian:trixie-slim sleep infinity
+
+          docker exec debian13-rootfs bash -euxc '
+            apt-get update
+
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              --no-install-recommends \
+              systemd-sysv \
+              openssh-server \
+              ca-certificates \
+              curl \
+              wget \
+              iproute2 \
+              iputils-ping \
+              procps \
+              nano \
+              vim-tiny \
+              sudo \
+              tzdata \
+              kmod \
+              udev \
+              netbase
+
+            ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+            echo Asia/Shanghai > /etc/timezone
+
+            mkdir -p /run/sshd /var/lock
+
+            rm -f /etc/ssh/ssh_host_*
+            truncate -s 0 /etc/machine-id
+            mkdir -p /var/lib/dbus
+            rm -f /var/lib/dbus/machine-id
+            ln -s /etc/machine-id /var/lib/dbus/machine-id
+
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+            rm -rf /tmp/* /var/tmp/*
+          '
+
+          docker export debian13-rootfs \
+            | gzip -1 > debian13-arm64-rootfs.tar.gz
+
+          sha256sum debian13-arm64-rootfs.tar.gz \
+            > SHA256SUMS.txt
+
+      - name: Upload root filesystem
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian13-arm64-rootfs
+          path: |
+            debian13-arm64-rootfs.tar.gz
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
