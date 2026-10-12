@@ -1,5 +1,5 @@
 
-name: Build Debian 13 ARM64 RootFS
+name: Build UFI103S Debian 13 ARM64
 
 on:
   workflow_dispatch:
@@ -10,71 +10,235 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Enable ARM64 emulation
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      - name: Build Debian 13 ARM64 root filesystem
+      - name: Create Debian 13 rootfs
         shell: bash
         run: |
           set -euxo pipefail
 
-          docker run \
-            --platform linux/arm64 \
-            --name debian13-rootfs \
-            -d debian:trixie-slim sleep infinity
+          docker run --platform linux/arm64 \
+            --name ufi-rootfs -d debian:trixie-slim \
+            sleep infinity
 
-          docker exec debian13-rootfs bash -euxc '
+          docker exec ufi-rootfs bash -euxc '
             apt-get update
-
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
-              --no-install-recommends \
-              systemd-sysv \
-              openssh-server \
-              ca-certificates \
-              curl \
-              wget \
-              iproute2 \
-              iputils-ping \
-              procps \
-              nano \
-              vim-tiny \
-              sudo \
-              tzdata \
-              kmod \
-              udev \
-              netbase
+              systemd systemd-sysv \
+              openssh-server ca-certificates \
+              curl wget iproute2 iputils-ping \
+              procps nano sudo tzdata kmod udev \
+              netbase hostapd dnsmasq iw rfkill iptables
 
-            ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-            echo Asia/Shanghai > /etc/timezone
+            echo "root:2289256127" | chpasswd
 
-            mkdir -p /run/sshd /var/lock
+            mkdir -p /etc/ssh/sshd_config.d
+            cat > /etc/ssh/sshd_config.d/10-ufi.conf <<EOF
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          EOF
+
+            mkdir -p /etc/hostapd
+            cat > /etc/hostapd/hostapd.conf <<EOF
+          interface=wlan0
+          driver=nl80211
+          country_code=CN
+          ssid=UFI103S
+          hw_mode=g
+          channel=6
+          wpa=2
+          wpa_passphrase=12345678
+          wpa_key_mgmt=WPA-PSK
+          rsn_pairwise=CCMP
+          EOF
+
+            mkdir -p /etc/dnsmasq.d
+            cat > /etc/dnsmasq.d/ufi103s.conf <<EOF
+          port=53
+          no-resolv
+          server=223.5.5.5
+          server=119.29.29.29
+          bind-dynamic
+          interface=wlan0
+          interface=usb0
+          dhcp-authoritative
+          dhcp-range=set:wifi,192.168.50.20,192.168.50.100,255.255.255.0,12h
+          dhcp-option=tag:wifi,option:router,192.168.50.1
+          dhcp-option=tag:wifi,option:dns-server,192.168.50.1
+          dhcp-range=set:usb,192.168.100.20,192.168.100.100,255.255.255.0,12h
+          dhcp-option=tag:usb,option:router,192.168.100.1
+          dhcp-option=tag:usb,option:dns-server,192.168.100.1
+          EOF
+
+            mkdir -p /etc/sysctl.d
+            echo "net.ipv4.ip_forward=1" \
+              > /etc/sysctl.d/99-ufi-forwarding.conf
+
+            mkdir -p /usr/local/sbin
+            cat > /usr/local/sbin/ufi-usb-gadget.sh <<EOF
+          #!/bin/sh
+          set -eu
+          mountpoint -q /sys/kernel/config || \
+            mount -t configfs configfs /sys/kernel/config
+          G=/sys/kernel/config/usb_gadget/g1
+          mkdir -p "\$G"
+
+          if [ -z "\$(cat "\$G/UDC" 2>/dev/null || true)" ]; then
+            echo 0x18d1 > "\$G/idVendor"
+            echo 0xd001 > "\$G/idProduct"
+            mkdir -p "\$G/strings/0x409"
+            mkdir -p "\$G/configs/c.1/strings/0x409"
+            mkdir -p "\$G/functions/rndis.usb0"
+
+            echo UFI103S > "\$G/strings/0x409/product"
+            echo UFI103S > "\$G/strings/0x409/serialnumber"
+            echo OpenAI > "\$G/strings/0x409/manufacturer"
+            echo USB-Network > "\$G/configs/c.1/strings/0x409/configuration"
+            echo 120 > "\$G/configs/c.1/MaxPower"
+
+            echo 02:11:22:33:44:55 > "\$G/functions/rndis.usb0/dev_addr"
+            echo 02:11:22:33:44:66 > "\$G/functions/rndis.usb0/host_addr"
+
+            [ -e "\$G/configs/c.1/rndis.usb0" ] || \
+              ln -s "\$G/functions/rndis.usb0" "\$G/configs/c.1/"
+
+            echo ci_hdrc.0 > "\$G/UDC"
+          fi
+
+          i=0
+          until ip link show usb0 >/dev/null 2>&1; do
+            i=\$((i+1))
+            [ "\$i" -lt 15 ] || exit 1
+            sleep 1
+          done
+          ip link set usb0 up
+          ip address replace 192.168.100.1/24 dev usb0
+          EOF
+            chmod 755 /usr/local/sbin/ufi-usb-gadget.sh
+
+            cat > /usr/local/sbin/ufi-nat.sh <<EOF
+          #!/bin/sh
+          set -eu
+          sysctl -w net.ipv4.ip_forward=1
+
+          iptables -t nat -C POSTROUTING -s 192.168.50.0/24 ! -o wlan0 -j MASQUERADE 2>/dev/null ||
+            iptables -t nat -A POSTROUTING -s 192.168.50.0/24 ! -o wlan0 -j MASQUERADE
+
+          iptables -t nat -C POSTROUTING -s 192.168.100.0/24 ! -o usb0 -j MASQUERADE 2>/dev/null ||
+            iptables -t nat -A POSTROUTING -s 192.168.100.0/24 ! -o usb0 -j MASQUERADE
+
+          iptables -C FORWARD -i wlan0 ! -o wlan0 -j ACCEPT 2>/dev/null ||
+            iptables -A FORWARD -i wlan0 ! -o wlan0 -j ACCEPT
+          iptables -C FORWARD -i usb0 ! -o usb0 -j ACCEPT 2>/dev/null ||
+            iptables -A FORWARD -i usb0 ! -o usb0 -j ACCEPT
+          iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+            iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          EOF
+            chmod 755 /usr/local/sbin/ufi-nat.sh
+
+            cat > /etc/systemd/system/ufi-usb-gadget.service <<EOF
+          [Unit]
+          Description=UFI103S USB RNDIS Network
+          After=local-fs.target
+          Before=dnsmasq.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/ufi-usb-gadget.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+            cat > /etc/systemd/system/ufi-wifi-ap.service <<EOF
+          [Unit]
+          Description=UFI103S WiFi Hotspot
+          After=network-pre.target
+          Before=dnsmasq.service
+
+          [Service]
+          Type=simple
+          ExecStartPre=/usr/sbin/ip link set wlan0 up
+          ExecStartPre=/usr/sbin/ip address replace 192.168.50.1/24 dev wlan0
+          ExecStart=/usr/sbin/hostapd /etc/hostapd/hostapd.conf
+          Restart=on-failure
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+            cat > /etc/systemd/system/ufi-nat.service <<EOF
+          [Unit]
+          Description=UFI103S Network Forwarding
+          After=ufi-usb-gadget.service ufi-wifi-ap.service dnsmasq.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/ufi-nat.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+            mkdir -p /etc/systemd/system/ufi-ssh-hostkeys.service.d
+            cat > /etc/systemd/system/ufi-ssh-hostkeys.service <<EOF
+          [Unit]
+          Description=Generate SSH host keys
+          Before=ssh.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/ssh-keygen -A
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+            mkdir -p /etc/systemd/system/ssh.service.d
+            cat > /etc/systemd/system/ssh.service.d/10-ufi.conf <<EOF
+          [Unit]
+          Wants=ufi-ssh-hostkeys.service
+          After=ufi-ssh-hostkeys.service
+          EOF
 
             rm -f /etc/ssh/ssh_host_*
+            ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+            echo Asia/Shanghai > /etc/timezone
             truncate -s 0 /etc/machine-id
-            mkdir -p /var/lib/dbus
-            rm -f /var/lib/dbus/machine-id
-            ln -s /etc/machine-id /var/lib/dbus/machine-id
+            mkdir -p /run/sshd
+
+            systemctl --root=/ enable \
+              ssh.service dnsmasq.service \
+              ufi-usb-gadget.service \
+              ufi-wifi-ap.service \
+              ufi-nat.service \
+              ufi-ssh-hostkeys.service
 
             apt-get clean
             rm -rf /var/lib/apt/lists/*
-            rm -rf /tmp/* /var/tmp/*
           '
 
-          docker export debian13-rootfs \
-            | gzip -1 > debian13-arm64-rootfs.tar.gz
+          docker export ufi-rootfs | gzip -1 \
+            > debian13-ufi103s-arm64-rootfs.tar.gz
 
-          sha256sum debian13-arm64-rootfs.tar.gz \
+          sha256sum debian13-ufi103s-arm64-rootfs.tar.gz \
             > SHA256SUMS.txt
 
-      - name: Upload root filesystem
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: debian13-arm64-rootfs
+          name: debian13-ufi103s-arm64
           path: |
-            debian13-arm64-rootfs.tar.gz
+            debian13-ufi103s-arm64-rootfs.tar.gz
             SHA256SUMS.txt
-          if-no-files-found: error
           retention-days: 14
