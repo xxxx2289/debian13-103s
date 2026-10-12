@@ -1,5 +1,5 @@
 
-name: UFI103S Debian 13 Full Source Build
+name: Build Lightweight Debian 13 for UFI103S
 
 on:
   workflow_dispatch:
@@ -7,435 +7,369 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: debian13-ufi103s-build
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
-      - name: Checkout my repository
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
 
       - name: Install build dependencies
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             git curl wget unzip \
             build-essential bc bison flex \
-            libssl-dev libelf-dev dwarves \
+            libssl-dev libelf-dev libncurses-dev \
+            device-tree-compiler \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             gcc-arm-none-eabi \
-            device-tree-compiler \
-            debootstrap qemu-user-static binfmt-support \
-            cpio rsync kmod e2fsprogs \
+            debootstrap qemu-user-static \
+            binfmt-support \
             android-sdk-libsparse-utils \
-            python3 python3-pip python3-dev \
-            python3-cryptography python3-pyasn1-modules \
-            python3-pycryptodome \
-            liblzma-dev
+            autoconf automake cmake libtool pkg-config \
+            fdisk e2fsprogs kmod cpio \
+            python3 python3-cryptography \
+            python3-pyasn1-modules python3-pycryptodome \
+            rsync xz-utils zstd
 
-      - name: Clone UFI103S firmware builder
+      - name: Clone UFI103S image builder
+        shell: bash
         run: |
+          set -euxo pipefail
           git clone --recurse-submodules \
             https://github.com/hmhmdcy/OpenStick-Builder-UFI001C.git \
             builder
+          cd builder
+          git submodule update --init --recursive
 
-      - name: Clone Linux source
+      - name: Clone Linux kernel source
+        shell: bash
         run: |
+          set -euxo pipefail
           git clone --depth=1 \
             --branch msm8916/6.12.1 \
             https://github.com/a520ass/linux-ufi.git \
             linux
 
-      - name: Configure kernel and disable Bluetooth
+      - name: Compile custom ARM64 kernel
         shell: bash
         run: |
           set -euxo pipefail
+          cd linux
 
-          SRC="$GITHUB_WORKSPACE/linux"
-          OUT="$GITHUB_WORKSPACE/kernel-out"
-          CROSS=aarch64-linux-gnu-
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            msm8916_defconfig
 
-          test -f "$SRC/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts"
+          # Disable Bluetooth but preserve Qualcomm Wi-Fi.
+          scripts/config --disable BT
+          scripts/config --disable BT_BREDR
+          scripts/config --disable BT_LE
+          scripts/config --module WCN36XX
+          scripts/config --enable CFG80211
+          scripts/config --enable MAC80211
 
-          # Disable the modem processor in the UFI device tree.
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          # USB device mode and configfs gadget support.
+          scripts/config --enable USB
+          scripts/config --enable USB_GADGET
+          scripts/config --enable USB_CONFIGFS
+          scripts/config --enable USB_CONFIGFS_RNDIS
+          scripts/config --enable USB_CHIPIDEA
+          scripts/config --enable USB_CHIPIDEA_UDC
 
-          p = Path(
-              "linux/arch/arm64/boot/dts/qcom/"
-              "msm8916-thwc-ufi001c.dts"
-          )
-          s = p.read_text()
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
 
-          if not re.search(r"&mpss\s*\{", s):
-              raise SystemExit("MPSS node not found; stopping safely")
+          make -j2 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image modules dtbs
 
-          if not re.search(r"&mpss\s*\{[^}]*status\s*=", s, re.S):
-              s, n = re.subn(
-                  r"(&mpss\s*\{)",
-                  r'\1\n\tstatus = "disabled";',
-                  s,
-                  count=1
-              )
-              if n != 1:
-                  raise SystemExit("Could not disable MPSS node")
+          test -s arch/arm64/boot/Image
+          test -s arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb
 
-          p.write_text(s)
-          PY
+          echo "KERNELRELEASE=$(make -s ARCH=arm64 kernelrelease)" \
+            >> "$GITHUB_ENV"
 
-          make -C "$SRC" O="$OUT" \
-            ARCH=arm64 CROSS_COMPILE="$CROSS" defconfig
-
-          "$SRC/scripts/config" --file "$OUT/.config" \
-            --set-str LOCALVERSION "-ufi103s" \
-            --disable LOCALVERSION_AUTO \
-            --enable MODULES \
-            --enable DEVTMPFS \
-            --enable DEVTMPFS_MOUNT \
-            --enable BLK_DEV_INITRD \
-            --enable MMC \
-            --enable MMC_BLOCK \
-            --enable MMC_SDHCI \
-            --enable MMC_SDHCI_MSM \
-            --enable EXT4_FS \
-            --enable SERIAL_MSM \
-            --enable SERIAL_MSM_CONSOLE \
-            --enable USB_GADGET \
-            --enable USB_CONFIGFS \
-            --enable USB_CONFIGFS_RNDIS \
-            --enable USB_CHIPIDEA \
-            --enable USB_CHIPIDEA_UDC \
-            --enable CFG80211 \
-            --enable MAC80211 \
-            --module WCN36XX \
-            --disable BT \
-            --disable BT_BREDR \
-            --disable BT_RFCOMM \
-            --disable BT_BNEP \
-            --disable BT_HIDP \
-            --disable BT_HCIBTUSB \
-            --disable BT_HCIUART
-
-          make -C "$SRC" O="$OUT" \
-            ARCH=arm64 CROSS_COMPILE="$CROSS" olddefconfig
-
-          if grep -Eq '^CONFIG_BT(=|_)' "$OUT/.config"; then
-            echo "Bluetooth options remain enabled:"
-            grep -E '^CONFIG_BT(=|_)' "$OUT/.config"
-            exit 1
-          fi
-
-          make -C "$SRC" O="$OUT" \
-            ARCH=arm64 CROSS_COMPILE="$CROSS" \
-            -j2 Image modules dtbs
-
-          test -s "$OUT/arch/arm64/boot/Image"
-
-          DTB="$(find "$OUT/arch/arm64/boot/dts" \
-            -name msm8916-thwc-ufi001c.dtb -print -quit)"
-
-          test -n "$DTB"
-          test -s "$DTB"
-
-          echo "$DTB" > "$GITHUB_WORKSPACE/ufi-dtb-path.txt"
-          make -s -C "$SRC" O="$OUT" \
-            ARCH=arm64 CROSS_COMPILE="$CROSS" kernelrelease \
-            > "$GITHUB_WORKSPACE/kernel-release.txt"
-
-          echo "Kernel release:"
-          cat "$GITHUB_WORKSPACE/kernel-release.txt"
-          ls -lh "$OUT/arch/arm64/boot/Image" "$DTB"
-
-      - name: Patch firmware builder
+      - name: Prepare UFI103S device tree and bootloader
         shell: bash
         run: |
           set -euxo pipefail
+          cd builder
+
+          # Use the UFI-family board identifier in lk2nd.
+          sed -i \
+            's/yiming,uz801-v3/thwc,ufi001c/g' \
+            scripts/build_hyp_aboot.sh
+
+          # Use the DTB compiled from our own kernel source.
+          mkdir -p dtbs
+          install -m 0644 \
+            "$GITHUB_WORKSPACE/linux/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb" \
+            dtbs/msm8916-thwc-ufi001c.dtb
+
+          # Do not blindly disable the MPSS device-tree node:
+          # Qualcomm remoteproc/firmware dependencies must be verified
+          # before making that hardware-level change.
+
+      - name: Fix Qualcomm firmware download and verify checksum
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd builder
 
           python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          # Remove modem management packages from the Debian rootfs.
-          p = Path("builder/scripts/setup.sh")
-          s = p.read_text()
-          lines = []
-
-          for line in s.splitlines():
-              package = line.strip().rstrip("\\").strip()
-              if package in {
-                  "modemmanager",
-                  "qrtr-tools",
-                  "rmtfs",
-              }:
-                  continue
-
-              if line.strip() == "passwd -d root":
-                  lines.append("echo 'root:2289256127' | chpasswd")
-              else:
-                  lines.append(line)
-
-          s = "\n".join(lines) + "\n"
-
-          if "2289256127" not in s:
-              raise SystemExit("Root password change was not applied")
-
-          p.write_text(s)
-
-          # Make firmware download more resilient.
-          p = Path("builder/scripts/extract_fw.sh")
+          p = Path("scripts/extract_fw.sh")
           s = p.read_text()
 
-          old = (
-              "wget -P ${TMPDIR} "
-              "http://releases.linaro.org/96boards/dragonboard410c/"
-              "linaro/rescue/21.12/"
-              "dragonboard-410c-bootloader-emmc-linux-176.zip"
-          )
-
-          new = (
-              "curl -fL --retry 5 --retry-delay 3 "
-              "--retry-all-errors "
-              "http://releases.linaro.org/96boards/dragonboard410c/"
-              "linaro/rescue/21.12/"
-              "dragonboard-410c-bootloader-emmc-linux-176.zip "
-              "-o ${TMPDIR}/dragonboard-410c-bootloader-emmc-linux-176.zip"
-          )
-
-          if old not in s:
-              raise SystemExit("Firmware download line not found")
-
-          p.write_text(s.replace(old, new))
-
-          # Do not download/install the precompiled kernel package.
-          p = Path("builder/scripts/debootstrap.sh")
-          s = p.read_text()
-
-          start = s.find("# install kernel")
-          end = s.find(
-              "mkdir -p ${CHROOT}/boot/extlinux",
-              start
-          )
+          start = s.find("# extract Qualcom firmware")
+          end = s.find("cleanup() {", start)
 
           if start < 0 or end < 0:
               raise SystemExit(
-                  "Could not locate kernel installation block"
+                  "Cannot locate firmware download section in extract_fw.sh"
               )
 
-          replacement = (
-              "# Kernel will be installed from source after debootstrap.\n"
-              "mkdir -p ${CHROOT}/boot/dtbs/qcom\n\n"
-          )
+          replacement = r'''# Download and verify Qualcomm firmware
+          SRC="https://archive.org/download/dragonboard-410c-bootloader-emmc-linux-176/dragonboard-410c-bootloader-emmc-linux-176.zip"
+          SHA256="a37c4e82a970ae2350fcfc7180559caf1dc3928e7c169316fe4ab899b7d305ad"
+          FNAME="dragonboard-410c-bootloader-emmc-linux-176.zip"
 
-          s = s[:start] + replacement + s[end:]
-          p.write_text(s)
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+              "$SRC" -o "${TMPDIR}/${FNAME}"
 
-          # Set hotspot SSID/password and interface addresses.
-          for p in Path("builder/configs").glob("*.nmconnection"):
-              s = p.read_text()
-              s = re.sub(
-                  r"(?im)^(\s*ssid\s*=\s*).*$",
-                  r"\g<1>UFI103S",
-                  s
-              )
-              s = re.sub(
-                  r"(?im)^(\s*psk\s*=\s*).*$",
-                  r"\g<1>12345678",
-                  s
-              )
-              s = s.replace("192.168.4.", "192.168.50.")
-              s = s.replace("192.168.5.", "192.168.100.")
-              p.write_text(s)
+          echo "${SHA256}  ${TMPDIR}/${FNAME}" | sha256sum -c -
+
+          unzip -o -j -d files/ "${TMPDIR}/${FNAME}" \
+              "${FNAME%.*}/rpm.mbn" \
+              "${FNAME%.*}/sbl1.mbn" \
+              "${FNAME%.*}/tz.mbn"
+
+          for f in rpm.mbn sbl1.mbn tz.mbn; do
+              test -s "files/$f" || {
+                  echo "Missing Qualcomm firmware: files/$f"
+                  exit 1
+              }
+          done
+
+          '''
+
+          p.write_text(s[:start] + replacement + s[end:])
           PY
 
-          DTB="$(cat "$GITHUB_WORKSPACE/ufi-dtb-path.txt")"
-          cp "$DTB" builder/dtbs/msm8916-thwc-ufi001c.dtb
-
-          echo "=== Rootfs packages ==="
-          grep -nE 'modemmanager|qrtr-tools|rmtfs|bluez' \
-            builder/scripts/setup.sh || true
-
-          echo "=== Network profiles ==="
-          grep -RInE 'ssid=|psk=|192\.168\.' \
-            builder/configs --include='*.nmconnection' || true
-
-      - name: Build bootloader
+      - name: Build bootloader and extract firmware
+        shell: bash
         run: |
           set -euxo pipefail
           cd builder
           sudo bash scripts/install_deps.sh
           sudo bash scripts/build_hyp_aboot.sh
-
-          test -s files/hyp.mbn
-          test -s files/aboot.mbn
-
-      - name: Extract Qualcomm firmware and verify
-        run: |
-          set -euxo pipefail
-          cd builder
-
           sudo bash scripts/extract_fw.sh
 
-          for f in \
-            gpt_both0.bin \
-            rpm.mbn \
-            sbl1.mbn \
-            tz.mbn
-          do
-            if ! test -s "files/$f"; then
-              echo "Missing firmware file: files/$f"
-              echo "Files currently generated:"
-              find files -maxdepth 1 -type f \
-                -printf '%f %s bytes\n' | sort
-              exit 1
-            fi
+          for f in aboot.mbn hyp.mbn rpm.mbn sbl1.mbn tz.mbn; do
+            test -s "files/$f"
           done
 
-      - name: Build Debian 13 root filesystem
-        run: |
-          set -euxo pipefail
-          cd builder
-
-          sudo env \
-            RELEASE=trixie \
-            CHROOT="$GITHUB_WORKSPACE/builder/rootfs" \
-            bash scripts/debootstrap.sh
-
-      - name: Install source-built kernel and modules
+      - name: Build minimal Debian 13 root filesystem
         shell: bash
         run: |
           set -euxo pipefail
+          cd builder
 
-          SRC="$GITHUB_WORKSPACE/linux"
-          OUT="$GITHUB_WORKSPACE/kernel-out"
-          ROOTFS="$GITHUB_WORKSPACE/builder/rootfs"
-          CROSS=aarch64-linux-gnu-
-          KREL="$(cat "$GITHUB_WORKSPACE/kernel-release.txt")"
-          DTB="$(cat "$GITHUB_WORKSPACE/ufi-dtb-path.txt")"
+          # Remove the default empty-root-password setting from the
+          # generated system later, after debootstrap has completed.
+          sudo env RELEASE=trixie \
+            CHROOT="$GITHUB_WORKSPACE/builder/rootfs" \
+            bash scripts/debootstrap.sh
 
-          test -d "$ROOTFS"
-          test -s "$OUT/arch/arm64/boot/Image"
-          test -s "$DTB"
+          test -d rootfs
+          test -f rootfs/etc/os-release
 
-          sudo make -C "$SRC" O="$OUT" \
-            ARCH=arm64 CROSS_COMPILE="$CROSS" \
-            INSTALL_MOD_PATH="$ROOTFS" modules_install
+      - name: Install custom kernel and configure the system
+        shell: bash
+        env:
+          ROOT_PASSWORD: 2289256127
+        run: |
+          set -euxo pipefail
 
-          # Remove module directories belonging to the old kernel.
+          BUILDER="$GITHUB_WORKSPACE/builder"
+          KERNEL="$GITHUB_WORKSPACE/linux"
+          ROOTFS="$BUILDER/rootfs"
+          KREL="$KERNELRELEASE"
+
+          test -s "$KERNEL/arch/arm64/boot/Image"
+          test -s "$KERNEL/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb"
+
+          # Install the kernel modules built from source.
+          sudo make -C "$KERNEL" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$ROOTFS" \
+            modules_install
+
+          # Keep only the modules matching our compiled kernel.
           sudo find "$ROOTFS/lib/modules" \
             -mindepth 1 -maxdepth 1 -type d \
             ! -name "$KREL" -exec rm -rf {} +
 
-          # Replace old kernel images with the source-built kernel.
-          sudo rm -f "$ROOTFS/boot/vmlinuz" \
-            "$ROOTFS/boot/vmlinuz-"*
+          sudo depmod -b "$ROOTFS" "$KREL"
 
+          # extlinux.conf expects /vmlinuz on the boot partition.
           sudo install -D -m 0644 \
-            "$OUT/arch/arm64/boot/Image" \
+            "$KERNEL/arch/arm64/boot/Image" \
             "$ROOTFS/boot/vmlinuz"
 
-          sudo install -D -m 0644 "$DTB" \
+          sudo install -D -m 0644 \
+            "$KERNEL/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb" \
             "$ROOTFS/boot/dtbs/qcom/msm8916-thwc-ufi001c.dtb"
 
-          sudo mkdir -p "$ROOTFS/etc/ssh/sshd_config.d"
+          # Configure root password without printing it.
+          printf 'root:%s\n' "$ROOT_PASSWORD" |
+            sudo chroot "$ROOTFS" chpasswd
 
-          sudo tee "$ROOTFS/etc/ssh/sshd_config.d/10-ufi103s.conf" \
-            >/dev/null <<'EOF'
+          # Disable Bluetooth and modem-management software.
+          # Keep Qualcomm firmware/transport components needed by Wi-Fi.
+          sudo chroot "$ROOTFS" /bin/bash -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get purge -y bluez bluez-tools blueman modemmanager || true
+            apt-get autoremove -y || true
+            apt-get clean
+            systemctl disable ModemManager.service 2>/dev/null || true
+            systemctl disable bluetooth.service 2>/dev/null || true
+            systemctl enable ssh.service 2>/dev/null || true
+            systemctl enable NetworkManager.service 2>/dev/null || true
+          '
+
+          # Allow SSH password login for root on the private device.
+          sudo install -d "$ROOTFS/etc/ssh/sshd_config.d"
+          sudo tee "$ROOTFS/etc/ssh/sshd_config.d/99-ufi103s.conf" >/dev/null <<'EOF'
           PermitRootLogin yes
           PasswordAuthentication yes
-          KbdInteractiveAuthentication no
           EOF
 
-          sudo systemctl --root="$ROOTFS" enable ssh.service
+          # Adjust the existing NetworkManager profiles when their
+          # original defaults are present.
+          if [ -d "$ROOTFS/etc/NetworkManager/system-connections" ]; then
+            sudo find "$ROOTFS/etc/NetworkManager/system-connections" \
+              -type f -name '*.nmconnection' \
+              -exec sed -i \
+                -e 's/Openstick/UFI103S/g' \
+                -e 's/openstick/12345678/g' \
+                -e 's/192\.168\.5\.1/192.168.100.1/g' {} +
+            sudo chmod 600 \
+              "$ROOTFS"/etc/NetworkManager/system-connections/*.nmconnection \
+              2>/dev/null || true
+          fi
 
-          # Verify the kernel, DTB and modules are present.
-          test -s "$ROOTFS/boot/vmlinuz"
-          test -s "$ROOTFS/boot/dtbs/qcom/msm8916-thwc-ufi001c.dtb"
-          test -d "$ROOTFS/lib/modules/$KREL"
+          # Automatically expand ext4 on the existing rootfs partition.
+          sudo tee "$ROOTFS/etc/systemd/system/ufi103s-resize-rootfs.service" >/dev/null <<'EOF'
+          [Unit]
+          Description=Expand UFI103S root filesystem
+          After=local-fs.target
+          ConditionPathExists=/dev/disk/by-partlabel/rootfs
 
-          # Repack rootfs after modifying the installed system.
-          cd "$GITHUB_WORKSPACE/builder"
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/resize2fs /dev/disk/by-partlabel/rootfs
+          RemainAfterExit=yes
 
-          sudo tar --numeric-owner --xattrs --acls \
-            -czpf rootfs.tgz \
-            --exclude=./usr/bin/qemu-aarch64-static \
-            -C rootfs .
+          [Install]
+          WantedBy=multi-user.target
+          EOF
 
-          sudo chown "$USER":"$USER" rootfs.tgz
-          ls -lh rootfs.tgz
+          sudo systemctl --root="$ROOTFS" enable \
+            ufi103s-resize-rootfs.service
 
-      - name: Build USB gadget tools
+          # Ensure Wi-Fi firmware files supplied by the base builder
+          # remain present; do not remove /lib/firmware or WCNSS files.
+          sudo test -d "$ROOTFS/lib/firmware"
+
+      - name: Build gadget tools
+        shell: bash
         run: |
           set -euxo pipefail
           cd builder
           sudo bash scripts/build_gt.sh
 
-      - name: Build final Fastboot images
+      - name: Repack root filesystem and create flash images
+        shell: bash
         run: |
           set -euxo pipefail
           cd builder
+
+          # Repack after custom kernel and configuration changes.
+          sudo tar cpzf rootfs.tgz \
+            --exclude="./usr/bin/qemu-aarch64-static" \
+            -C rootfs .
+
           sudo bash scripts/build_images.sh
 
-      - name: Verify and record firmware
-        run: |
-          set -euxo pipefail
-          cd builder
-
-          for f in \
-            gpt_both0.bin \
-            hyp.mbn \
-            rpm.mbn \
-            sbl1.mbn \
-            tz.mbn \
-            aboot.mbn \
-            boot.bin \
-            rootfs.bin
-          do
-            if ! test -s "files/$f"; then
-              echo "Missing or empty output: files/$f"
-              find files -maxdepth 1 -type f \
-                -printf '%f %s bytes\n' | sort
-              exit 1
-            fi
+          for f in boot.bin rootfs.bin; do
+            test -s "files/$f"
           done
 
-          {
-            echo "Target: UFI103S / MSM8916"
-            echo "OS: Debian 13 (trixie)"
-            echo "Kernel source: a520ass/linux-ufi"
-            echo "Kernel branch: msm8916/6.12.1"
-            echo "Kernel release: $(cat ../kernel-release.txt)"
-            echo "Bluetooth: disabled in kernel config"
-            echo "Root password: 2289256127"
-            echo "Wi-Fi SSID: UFI103S"
-            echo "Wi-Fi password: 12345678"
-            echo "USB RNDIS IP: 192.168.100.1"
-            echo
-            ls -lh files/
-          } > files/BUILD-INFO.txt
+          # Do not publish the generated GPT as a ready-to-flash image.
+          # Its partition layout must not overwrite the existing device GPT
+          # until the actual eMMC partition geometry has been verified.
+          rm -f files/gpt_both0.bin
 
-          cd files
-          sha256sum \
-            gpt_both0.bin hyp.mbn rpm.mbn sbl1.mbn \
-            tz.mbn aboot.mbn boot.bin rootfs.bin \
-            > SHA256SUMS.txt
+          cat > files/FLASH-INSTRUCTIONS.txt <<'EOF'
+          UFI103S - Debian 13 ARM64
 
-      - name: Upload complete firmware
+          Build target:
+          - UFI103S / Qualcomm MSM8916
+          - Debian 13 Trixie, ARM64
+          - Kernel compiled from source
+          - Bluetooth software removed
+          - SSH enabled
+          - Root password: 2289256127
+          - Intended USB RNDIS address: 192.168.100.1
+
+          IMPORTANT:
+          This artifact deliberately does not include gpt_both0.bin.
+          Do not flash a GPT generated by another board or an unverified
+          partition layout. This build assumes the existing device already
+          has the expected boot and rootfs partitions.
+
+          Before flashing, verify the actual partition table and that the
+          bootloader supports this boot image and device tree. Back up the
+          unique device partitions (fsc, fsg, modem, modemst1, modemst2,
+          persist and sec) before any operation that could overwrite them.
+
+          The rootfs image is smaller than the eMMC. On first boot, the
+          resize service attempts to expand ext4 to the existing rootfs
+          partition size.
+
+          Wi-Fi AP settings depend on the builder's NetworkManager profile
+          format. Confirm the generated profile and actual interface after
+          first boot.
+          EOF
+
+          echo "Final artifact files:"
+          ls -lh files/
+
+      - name: Upload flash images
         uses: actions/upload-artifact@v4
         with:
-          name: UFI103S-Debian13-Full-Firmware
-          path: builder/files/*
+          name: Debian13-UFI103S-ARM64-source-kernel
           if-no-files-found: error
-          retention-days: 14
-
-      - name: Diagnostic files on failure
-        if: failure()
-        run: |
-          echo "===== Builder output files ====="
-          find builder/files -maxdepth 2 -type f \
-            -printf '%p %s bytes\n' 2>/dev/null | sort || true
-
-          echo "===== Kernel config ====="
-          grep -E '^CONFIG_(BT|WCN36XX|MMC|EXT4_FS|USB_GADGET)' \
-            kernel-out/.config 2>/dev/null || true
+          path: |
+            builder/files/aboot.mbn
+            builder/files/hyp.mbn
+            builder/files/rpm.mbn
+            builder/files/sbl1.mbn
+            builder/files/tz.mbn
+            builder/files/boot.bin
+            builder/files/rootfs.bin
+            builder/files/FLASH-INSTRUCTIONS.txt
