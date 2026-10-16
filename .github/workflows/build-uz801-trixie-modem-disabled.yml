@@ -1,0 +1,173 @@
+name: Build UZ801 Debian 13 modem-disabled
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout customization repository
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl wget ca-certificates zip unzip rsync \
+            qemu-user-static binfmt-support e2fsprogs parted gdisk \
+            dosfstools xz-utils bzip2 tar python3 file util-linux
+
+      - name: Fetch OpenStick MSM8916 firmware builder
+        run: |
+          git clone --depth 1 https://github.com/jimmylpx/openstick.git openstick
+          test -x openstick/builder/build.sh || test -f openstick/builder/build.sh
+          test -f openstick/builder/firmware/boot_modem_disabled.bin
+          test -f openstick/builder/overlay/etc/NetworkManager/system-connections/hotspot.nmconnection
+
+      - name: Apply user configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openstick/builder
+
+          # Set the AP credentials without changing its bridge/network settings.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('overlay/etc/NetworkManager/system-connections/hotspot.nmconnection')
+          s = p.read_text()
+          import re
+          if re.search(r'(?m)^ssid=', s):
+              s = re.sub(r'(?m)^ssid=.*$', 'ssid=4G-WIFI', s)
+          else:
+              raise SystemExit('Could not find ssid= in the upstream hotspot profile')
+          if re.search(r'(?m)^psk=', s):
+              s = re.sub(r'(?m)^psk=.*$', 'psk=12345678', s)
+          else:
+              raise SystemExit('Could not find psk= in the upstream hotspot profile')
+          p.write_text(s)
+          PY
+
+          # Bluetooth + SSH. Do not replace kernel or delete Wi-Fi/WCNSS firmware.
+          mkdir -p config hooks
+          cat > config/custom_packages.list <<'PKGS'
+          bluez
+          bluez-tools
+          openssh-server
+          PKGS
+
+          cat > hooks/custom.sh <<'HOOK'
+          #!/bin/bash
+          # Runs inside the Debian ARM64 rootfs by the upstream QEMU/chroot builder.
+          set -u
+          export DEBIAN_FRONTEND=noninteractive
+
+          echo 'root:2289256127' | chpasswd
+
+          # SSH starts on boot and permits root/password login for local setup.
+          # Change the root password after first login. Do not expose this device to the public Internet.
+          mkdir -p /etc/ssh/sshd_config.d /etc/systemd/system/multi-user.target.wants
+          cat > /etc/ssh/sshd_config.d/90-uz801-local.conf <<'SSHD'
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          UseDNS no
+          SSHD
+          if [ -f /etc/ssh/sshd_config ] && ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config; then
+            sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+          fi
+          if [ -e /lib/systemd/system/ssh.service ]; then
+            ln -sf /lib/systemd/system/ssh.service /etc/systemd/system/multi-user.target.wants/ssh.service
+          elif [ -e /usr/lib/systemd/system/ssh.service ]; then
+            ln -sf /usr/lib/systemd/system/ssh.service /etc/systemd/system/multi-user.target.wants/ssh.service
+          fi
+
+          # The modem-disabled kernel variant is intended to run without cellular data.
+          # Remove cellular userspace packages if present; do not touch WCNSS/Wi-Fi firmware.
+          REMOVE=()
+          for p in modemmanager mobile-broadband-provider-info qrtr-tools rmtfs \
+                   libqmi-glib5 libqmi-proxy libqmi-utils \
+                   libmbim-glib4 libmbim-proxy libmbim-utils ppp; do
+            status="$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null || true)"
+            if [ "$status" = installed ]; then REMOVE+=("$p"); fi
+          done
+          if [ "${#REMOVE[@]}" -gt 0 ]; then
+            apt-get -y purge "${REMOVE[@]}" || true
+          fi
+          apt-get -y autoremove --purge || true
+          apt-get clean || true
+          rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
+
+          # Keep the upstream modem-disabled service masks. These services are not
+          # needed for cellular data, but kernel/device-tree reserved RAM is a separate matter.
+          mkdir -p /etc/systemd/system
+          ln -sf /dev/null /etc/systemd/system/ModemManager.service
+          ln -sf /dev/null /etc/systemd/system/dbus-org.freedesktop.ModemManager1.service
+          ln -sf /dev/null /etc/systemd/system/rmtfs.service
+          ln -sf /dev/null /etc/systemd/system/qrtr-ns.service
+          rm -f /etc/systemd/system/multi-user.target.wants/ModemManager.service
+
+          # Enable BlueZ Bluetooth service at boot.
+          if [ -e /lib/systemd/system/bluetooth.service ]; then
+            ln -sf /lib/systemd/system/bluetooth.service /etc/systemd/system/multi-user.target.wants/bluetooth.service
+          elif [ -e /usr/lib/systemd/system/bluetooth.service ]; then
+            ln -sf /usr/lib/systemd/system/bluetooth.service /etc/systemd/system/multi-user.target.wants/bluetooth.service
+          fi
+
+          # Record the requested image role for post-build inspection.
+          mkdir -p /etc/uz801-build
+          cat > /etc/uz801-build/profile.txt <<'PROFILE'
+          Debian 13 Trixie
+          MSM8916 modem-disabled kernel profile (upstream OpenStick)
+          Cellular userspace removed where installed
+          Wi-Fi/WCNSS firmware intentionally retained
+          Bluetooth enabled (BlueZ)
+          Hotspot SSID: 4G-WIFI
+          Hotspot password: 12345678
+          USB/RNDIS bridge IP: expected 192.168.100.1 from upstream profile
+          root password: 2289256127
+          SSH enabled
+          PROFILE
+          HOOK
+          chmod +x hooks/custom.sh
+
+      - name: Build Debian 13 modem-disabled image
+        run: |
+          cd openstick/builder
+          sudo bash ./build.sh --target trixie-modem-disabled
+
+      - name: Prepare downloadable images and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifact
+          B=openstick/builder
+          P="$B/build_trixie-modem-disabled/partitions"
+          test -f "$B/output/trixie-modem-disabled.zip"
+          test -s "$P/rootfs.bin"
+          test -s "$P/boot.bin"
+          cp "$B/output/trixie-modem-disabled.zip" release-artifact/
+          cp "$P/rootfs.bin" release-artifact/rootfs.bin
+          cp "$P/boot.bin" release-artifact/boot-modem-disabled.bin
+          cat > release-artifact/FLASH-WARNING.txt <<'WARN'
+          This build was produced from the public OpenStick MSM8916 builder. It is NOT yet hardware-validated on this exact jsbsbxjxh66,uz801 board/kernel.
+
+          The ZIP contains multiple Qualcomm/partition images. Do not flash the whole ZIP or GPT/bootloader parts blindly.
+          The raw rootfs and boot images are provided separately for inspection and possible partition-specific flashing ONLY after confirming the actual Fastboot partition names, sizes, and board compatibility.
+          A rootfs-only flash will not reclaim reserved modem RAM; that also needs a compatible modem-disabled boot/kernel/device tree.
+          Keep the original firmware recoverability path available before flashing, even if you do not want to make a full backup.
+
+          Modem-disabled profile keeps WCNSS/Wi-Fi firmware and enables Bluetooth/SSH. Expected local access credentials are documented in the kit README.
+          WARN
+          (cd release-artifact && sha256sum trixie-modem-disabled.zip rootfs.bin boot-modem-disabled.bin > SHA256SUMS)
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uz801-debian13-trixie-modem-disabled
+          path: release-artifact/*
+          if-no-files-found: error
+          retention-days: 14
